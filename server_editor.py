@@ -17,6 +17,8 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
+from typing import List, Tuple
+import re
 
 import numpy as np
 import requests
@@ -28,6 +30,12 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from scipy.io import wavfile
+
+import os
+from style_bert_vits2.nlp import bert_models
+from style_bert_vits2.constants import Languages
+
+from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone, kata_tone2phone_tone, is_japanese
 
 from config import get_path_config
 from style_bert_vits2.constants import (
@@ -55,12 +63,66 @@ from style_bert_vits2.nlp.japanese.user_dict import (
 from style_bert_vits2.tts_model import TTSModelHolder, TTSModelInfo
 
 
+# BERTモデルのパスを設定
+bert_model_path = "/home/starnight_0678/Style-Bert-VITS2/bert/deberta-v3-large"
+
+# 必要な箇所でパスを使用
+bert_tokenizer = bert_models.load_tokenizer(Languages.EN, bert_model_path)
 # ---フロントエンド部分に関する処理---
 
 # エディターのビルドファイルを配置するディレクトリ
 STATIC_DIR = Path("static")
 # エディターの最新のビルドファイルのダウンロード日時を記録するファイル
 LAST_DOWNLOAD_FILE = STATIC_DIR / "last_download.txt"
+
+def preprocess_text(text: str) -> str:
+    # 改行を空白に置き換える
+    text = text.replace('\n', ' ').replace('\r', '')
+    # 日本語と英語の句読点、感嘆符、アポストロフィを残し、他の記号をピリオドに置き換える
+    text = re.sub(r'[^\w\s.,!?\'。、！？]', '.', text)
+    return text
+
+def split_text(text: str, max_length: int = 70) -> List[str]:
+    """
+    長いテキストを指定された長さで分割する。
+    Args:
+        text: 入力テキスト。
+        max_length: 分割する際の最大長さ。
+    Returns:
+        分割されたテキストのリスト。
+    """
+    sentences = re.split(r'(?<=[。！？.?!])', text)
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= max_length:
+            current_chunk += sentence
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = sentence
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+def generate_tone_list(text: str, language: str) -> Tuple[List[str], List[int]]:
+    """
+    テキストからトーンリストを生成する。
+    Args:
+        text: 入力テキスト。
+        language: 言語。
+    Returns:
+        トーンリスト。
+    """
+    try:
+        kata_tone_list = g2kata_tone(text, language)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to convert text to katakana and tone: {e}")
+
+    phone_tone = kata_tone2phone_tone(kata_tone_list, language)
+    phones = [phone for phone, _ in phone_tone]
+    tones = [tone for _, tone in phone_tone]
+    return phones, tones
 
 
 def download_static_files(user, repo, asset_name):
@@ -231,15 +293,24 @@ class TextRequest(BaseModel):
 @router.post("/g2p")
 async def read_item(item: TextRequest):
     try:
-        # 最初に正規化しないと整合性がとれない
-        text = normalize_text(item.text)
-        kata_tone_list = g2kata_tone(text)
+        text = item.text
+        if is_japanese(text):
+            text = normalize_text(text)
+            language = Languages.JP
+        else:
+            language = Languages.EN
+        kata_tone_list = g2kata_tone(text, language)
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail=f"Failed to convert {item.text} to katakana and tone, {e}",
         )
     return [MoraTone(mora=kata, tone=tone) for kata, tone in kata_tone_list]
+
+
+
+
+
 
 
 @router.post("/normalize")
@@ -289,12 +360,28 @@ def synthesis(request: SynthesisRequest):
             status_code=500,
             detail=f"Failed to load model {request.model} from {request.modelFile}, {e}",
         )
+    
     text = request.text
+    if is_japanese(text):
+        language = Languages.JP
+    else:
+        language = Languages.EN
+    
+    # 前処理を適用して記号と改行を空白に置き換え
+    processed_text = preprocess_text(text)
+
+    print(f"Processing text: {processed_text}")
+    print(f"Language: {language}")
+
     kata_tone_list = [
         (mora_tone.mora, mora_tone.tone) for mora_tone in request.moraToneList
     ]
-    phone_tone = kata_tone2phone_tone(kata_tone_list)
+    phone_tone = kata_tone2phone_tone(kata_tone_list, language)
     tone = [t for _, t in phone_tone]
+
+    print(f"Generated phones: {phone_tone}")
+    print(f"Generated tones: {tone}")
+
     try:
         sid = 0 if request.speaker is None else model.spk2id[request.speaker]
     except KeyError:
@@ -303,8 +390,8 @@ def synthesis(request: SynthesisRequest):
             detail=f"Speaker {request.speaker} not found in {model.spk2id}",
         )
     sr, audio = model.infer(
-        text=text,
-        language=request.language,
+        text=processed_text,
+        language=language,
         sdp_ratio=request.sdpRatio,
         noise=request.noise,
         noise_w=request.noisew,
@@ -324,6 +411,7 @@ def synthesis(request: SynthesisRequest):
     with BytesIO() as wavContent:
         wavfile.write(wavContent, sr, audio)
         return Response(content=wavContent.getvalue(), media_type="audio/wav")
+
 
 
 class MultiSynthesisRequest(BaseModel):
@@ -356,15 +444,32 @@ def multi_synthesis(request: MultiSynthesisRequest):
                 status_code=500,
                 detail=f"Failed to load model {req.model} from {req.modelFile}, {e}",
             )
+        
         text = req.text
+        if is_japanese(text):
+            language = Languages.JP
+        else:
+            language = Languages.EN
+        
+        # 前処理を適用して改行と特定の記号を空白に置き換え
+        processed_text = preprocess_text(text)
+
         kata_tone_list = [
             (mora_tone.mora, mora_tone.tone) for mora_tone in req.moraToneList
         ]
-        phone_tone = kata_tone2phone_tone(kata_tone_list)
+        phone_tone = kata_tone2phone_tone(kata_tone_list, language)
         tone = [t for _, t in phone_tone]
+
+        try:
+            sid = 0 if req.speaker is None else model.spk2id[req.speaker]
+        except KeyError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Speaker {req.speaker} not found in {model.spk2id}",
+            )
         sr, audio = model.infer(
-            text=text,
-            language=req.language,
+            text=processed_text,
+            language=language,
             sdp_ratio=req.sdpRatio,
             noise=req.noise,
             noise_w=req.noisew,
@@ -378,6 +483,7 @@ def multi_synthesis(request: MultiSynthesisRequest):
             line_split=False,
             pitch_scale=req.pitchScale,
             intonation_scale=req.intonationScale,
+            speaker_id=sid,
         )
         audios.append(audio)
         if i < len(lines) - 1:
@@ -388,6 +494,65 @@ def multi_synthesis(request: MultiSynthesisRequest):
     with BytesIO() as wavContent:
         wavfile.write(wavContent, sr, audio)
         return Response(content=wavContent.getvalue(), media_type="audio/wav")
+
+
+
+class TextRequest(BaseModel):
+    text: str
+
+@app.post("/api/text_synthesis", response_class=Response)
+def text_synthesis(request: TextRequest):
+    try:
+        model = model_holder.get_model("himari-v3", "model_assets/himari-v3/himari-v3.safetensors")
+    except Exception as e:
+        logger.error(e)
+        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+
+    processed_text = preprocess_text(request.text)
+
+    if is_japanese(processed_text):
+        language = Languages.JP
+        processed_text = normalize_text(processed_text)
+    else:
+        language = Languages.EN
+
+    try:
+        kata_tone_list = g2kata_tone(processed_text, language)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to convert text to katakana and tone: {e}")
+
+    phone_tone = kata_tone2phone_tone(kata_tone_list, language)
+    tone = [t for _, t in phone_tone]
+
+    try:
+        sid = model.spk2id.get("speaker-id", 0)
+    except KeyError:
+        raise HTTPException(status_code=400, detail="Speaker not found")
+
+    sr, audio = model.infer(
+        text=processed_text,
+        language=language,
+        sdp_ratio=0.2,
+        noise=0.6,
+        noise_w=0.8,
+        length=1 / 1.2,
+        given_tone=tone,
+        style="Neutral",
+        style_weight=5,
+        assist_text="",
+        assist_text_weight=1,
+        use_assist_text=False,
+        line_split=False,
+        pitch_scale=1,
+        intonation_scale=1,
+        speaker_id=sid,
+    )
+
+    with BytesIO() as wavContent:
+        wavfile.write(wavContent, sr, audio)
+        return Response(content=wavContent.getvalue(), media_type="audio/wav")
+
+
 
 
 class UserDictWordRequest(BaseModel):
