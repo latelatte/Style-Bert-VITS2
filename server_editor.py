@@ -62,6 +62,7 @@ from style_bert_vits2.nlp.japanese.user_dict import (
 )
 from style_bert_vits2.tts_model import TTSModelHolder, TTSModelInfo
 
+download_model()
 
 # BERTモデルのパスを設定
 bert_model_path = "/home/starnight_0678/Style-Bert-VITS2/bert/deberta-v3-large"
