@@ -24,3 +24,4 @@ torchaudio<2.4
 transformers
 umap-learn
 gdown
+uvicorn
