@@ -1,1 +1,1 @@
-web: bash download_models.sh && python server_editor.py --line_length 500 --line_count 10
+web: python3 model_download.py && python3 server_editor.py --line_length 500 --line_count 10
